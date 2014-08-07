@@ -1,0 +1,171 @@
+#!/usr/bin/perl -wT
+#============================================================================#
+# List all block devices that not exists in fstab                            #
+#============================================================================#
+# (C) Denis Smirnov <mithraen@freesource.info>                               #
+#============================================================================#
+use strict;
+use warnings qw(FATAL all);
+use Cwd 'abs_path';
+use Text::Table;
+
+my %devices;
+
+# List all USB devices
+foreach ( glob("/dev/disk/by-path/*-usb-*") ) {
+    $devices{ abs_path($_) } = 1;
+}
+
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV', 'PATH'};
+
+# List all removable devices
+{
+    my @devs = split( "\n", `/bin/lsblk -d -r -o RM,KNAME` );
+    foreach (@devs) {
+        next unless /^1\s+(.+)$/;
+        $devices{ '/dev/' . $1 } = 1;
+    }
+}
+
+# List all devices in /etc/pmount.allow
+if ( open my $fh, "<", "/etc/pmount.allow" ) {
+    while (<$fh>) {
+        s/#.*//;
+        s/\s+$//;
+        next if $_ eq '';
+        $_ = abs_path($_) if -l $_;
+        $devices{$_} = 1;
+    }
+    close $fh;
+}
+
+# Parse /etc/fstab
+my %disks;
+my %fstab_dev;
+my %fstab_uuid;
+my %fstab_label;
+
+sub parse_fstab($) {
+    open( my $fh, "<", $_[0] ) || return;
+    my @out;
+    while (<$fh>) {
+        my %h;
+        s/#.*//;
+        s/\s+$//;
+        next if $_ eq '';
+
+        my ( $dev, $uuid, $label ) = ( '', '', '' );
+        if (s/^UUID=([^\s"]+)\s+//) {
+            $uuid = $1;
+            $h{uuid} = $1;
+        }
+        elsif (s/^UUID="([^"]+)"\s+//) {
+            $uuid = $1;
+            $h{uuid} = $1;
+        }
+        elsif (s/^LABEL=([^\s"]+)\s+//) {
+            $label = $1;
+            $h{label} = $1;
+        }
+        elsif (s/^LABEL="((?:[^"]|"")+)"\s+//) {
+            $label = $1;
+            $label =~ s/""/"/g;
+            $h{label} = $1;
+        }
+        elsif (s/^([^\s"]+)\s+//) {
+            $dev = $1;
+            $h{dev} = $1;
+        }
+        else {
+            next;
+        }
+        my @fields = split( /\s+/, $_ );
+        $h{mountpoint} = shift(@fields);
+        $h{fs}         = shift(@fields);
+        my @opts = split( ',', shift(@fields) );
+        foreach my $opt (@opts) {
+            $h{opts}->{$opt} = 1;
+        }
+
+        push @out, \%h;
+    }
+    close $fh;
+    return @out;
+}
+
+sub parse_line($) {
+    my $fields = $_[0];
+    my %h;
+    while ( $fields =~ s/^\s*([^"]+)="([^\"]*)"\s*// ) {
+        $h{$1} = $2;
+    }
+    my $dev = $h{KNAME};
+    if ( $h{TYPE} eq 'disk' ) {
+        $disks{$dev} = \%h;
+    }
+    if ( $h{TYPE} eq 'part' ) {
+        my $basedev = $dev;
+        $basedev =~ s/\d+$//;
+        foreach my $key ( keys %h ) {
+            if ( $h{$key} eq '' ) {
+                $h{$key} = $disks{$basedev}->{$key};
+            }
+        }
+    }
+
+    return if $h{FSTYPE} eq '';
+    return if $h{FSTYPE} eq 'swap';
+    return if $h{FSTYPE} eq 'linux_raid_member';
+    return if $h{FSTYPE} eq 'LVM2_member';
+
+    # skip FS in fstab
+    return if defined $fstab_label{ $h{LABEL} };
+    return if defined $fstab_uuid{ $h{UUID} };
+    return if defined $fstab_dev{ "/dev/" . $h{KNAME} };
+
+    return \%h;
+}
+
+foreach ( parse_fstab "/etc/fstab" ) {
+    if ( defined $_->{opts}->{user} ) {
+        if ( defined $_->{dev} ) {
+            my $dev = $_->{dev};
+            $dev = abs_path($dev) if -l $dev;
+            $devices{$dev} = 1;
+        }
+        next;
+    }
+
+    if ( defined $_->{dev} ) {
+        my $dev = $_->{dev};
+        $dev = abs_path($dev) if -l $dev;
+        $fstab_dev{$dev} = 1;
+    }
+    $fstab_label{ $_->{label} } = 1 if defined $_->{label};
+    $fstab_uuid{ $_->{uuid} }   = 1 if defined $_->{uuid};
+}
+
+my @out;
+
+# Get all info about removable and USB devices
+open( my $fh, "-|", '/bin/lsblk', '-o',
+    'NAME,FSTYPE,LABEL,MOUNTPOINT,SIZE,RM,KNAME,MODEL,TYPE,UUID', '-P' );
+
+my $tb =
+  Text::Table->new( 'NAME', 'MOUNTPOINT', 'LABEL', 'FSTYPE', "SIZE\n&left",
+    'MODEL' );
+
+while (<$fh>) {
+    my $h = parse_line($_);
+    next unless defined $h;
+    next unless defined $devices{ "/dev/" . $h->{KNAME} };
+    $tb->add(
+        $h->{NAME},   $h->{MOUNTPOINT}, $h->{LABEL},
+        $h->{FSTYPE}, $h->{SIZE},       $h->{MODEL}
+    );
+
+    my $dev = "/dev/" . $h->{KNAME};
+    push @out, $dev;
+}
+
+print $tb;
