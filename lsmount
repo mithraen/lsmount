@@ -168,4 +168,5 @@ while (<$fh>) {
     push @out, $dev;
 }
 
+exit if @out == 0;
 print $tb;
